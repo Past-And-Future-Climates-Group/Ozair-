@@ -1,0 +1,350 @@
+from shiny import App, ui, render, reactive
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+import numpy as np
+import xarray as xr
+from shinywidgets import output_widget, render_widget
+
+# --- Load CSV ---
+def load_csv_minimum_temperature_data():
+    try:
+        possible_filenames = ['chart.csv', 'chart (1).csv', 'chart1.csv']
+        found_path = None
+        import os
+        for root, _, files in os.walk("."):
+            for f in files:
+                if f in possible_filenames:
+                    found_path = os.path.join(root, f)
+                    break
+            if found_path:
+                break
+        if not found_path:
+            raise FileNotFoundError("No CSV file matching expected names found.")
+        try:
+            df = pd.read_csv(found_path, skiprows=8)
+        except Exception:
+            df = pd.read_csv(found_path)
+
+        df.rename(columns=lambda x: x.strip(), inplace=True)
+        df["year"] = pd.to_numeric(df.iloc[:, 0], errors="coerce")
+        df.dropna(subset=["year"], inplace=True)
+        df["year"] = df["year"].astype(int)
+        return df
+
+    except Exception as e:
+        print(f"Error loading CSV: {e}")
+        return None
+
+
+# --- UI ---
+app_ui = ui.page_fluid(
+    ui.tags.head(
+        ui.tags.style("""
+            .custom-card {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border-radius: 15px;
+                padding: 20px;
+                margin: 10px 0;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            }
+            .metric-card {
+                background: white;
+                border-radius: 10px;
+                padding: 15px;
+                margin: 10px 0;
+                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+                border-left: 4px solid #667eea;
+            }
+        """)
+    ),
+    ui.h2("🌊 Santa Barbara Climate Data Dashboard", class_="text-center"),
+    ui.div(
+        ui.p("📊 Data Source: Cal-Adapt CSV & NetCDF Climate Data", class_="text-center text-muted"),
+        class_="data-source"
+    ),
+    ui.navset_tab(
+        ui.nav_panel("🏠 Welcome",
+            ui.div(
+                ui.h3("Welcome!", class_="text-center"),
+                ui.p("Explore Santa Barbara's climate using Cal-Adapt data and NetCDF climate models.", class_="text-center"),
+                class_="container"
+            )
+        ),
+        ui.nav_panel("📚 User Guide / Glossary / About",
+            ui.div(
+                ui.h4("User Guide"),
+                ui.tags.ul([
+                    ui.tags.li("Navigate to Campus Point tab"),
+                    ui.tags.li("Select location and data type"),
+                    ui.tags.li("Use dropdowns and slider to explore data"),
+                    ui.tags.li("Use the Location Map tab to select gridboxes and explore their climate data"),
+                ]),
+                ui.hr(),
+                ui.h4("Glossary"),
+                ui.p("Cal-Adapt: California’s climate planning platform."),
+                class_="container"
+            )
+        ),
+        ui.nav_panel("📍 Location Data",
+            ui.div(
+                ui.h4("Campus Point"),
+                ui.p("Mild coastal climate, ocean-cooled with foggy mornings."),
+                class_="container"
+            )
+        ),
+        ui.nav_panel("📊 Campus Point Data",
+            ui.div(
+                ui.h3("Campus Point Climate Data"),
+
+                # Inputs
+                ui.input_select("location", "Select Location:", choices=["Campus Point", "Another Location"]),
+                ui.input_select("data_type", "Select Data Type:", choices=[
+                    "Precipitation", "Sea Level Rise", 
+                    "Minimum/Maximum Temperature Projections", 
+                    "Droughts", "Wildfires"
+                ]),
+                ui.output_ui("temp_subcategory_ui"),
+                ui.output_ui("graph_controls_ui"),
+                output_widget("climate_plot"),
+
+                class_="container"
+            )
+        ),
+
+        ui.nav_panel("📍 Location Map",
+            ui.div(
+                ui.input_file("nc_upload", "Upload NetCDF File:"),  # Upload widget here
+                output_widget("gridbox_map"),
+                ui.output_text("selected_gridbox_info"),
+                output_widget("gridbox_climate_plot"),
+                class_="container"
+            )
+        ),
+
+        id="main_tabs"
+    )
+)
+
+
+# --- Server ---
+def server(input, output, session):
+    csv_data = reactive.Value(None)
+    netcdf_ds = reactive.Value(None)
+
+    # Load CSV once at start
+    @reactive.Effect
+    def _():
+        if csv_data.get() is None:
+            csv_data.set(load_csv_minimum_temperature_data())
+
+    # Load NetCDF reactively from uploaded file (fix for upload list)
+    @reactive.Effect
+    def _():
+        upload = input.nc_upload()
+        if upload is not None:
+            try:
+                # Fix: handle upload as list or single dict
+                first_file = upload[0] if isinstance(upload, list) else upload
+                ds = xr.open_dataset(first_file['datapath'], engine="netcdf4")
+                netcdf_ds.set(ds)
+            except Exception as e:
+                print(f"Error reading uploaded NetCDF file: {e}")
+
+    # --- CSV dependent UI from your original code ---
+    @output
+    @render.ui
+    def temp_subcategory_ui():
+        if input.data_type() == "Minimum/Maximum Temperature Projections":
+            return ui.input_select("temp_subcategory", "Select Temperature Data Type:", choices=[
+                "Annual Averages", 
+                "Extreme Heat Days and Warm Nights", 
+                "Cooling Degree Days and Heating Degree Days"
+            ])
+        return None
+
+    @output
+    @render.ui
+    def graph_controls_ui():
+        if input.data_type() == "Minimum/Maximum Temperature Projections" and input.temp_subcategory() == "Annual Averages":
+            return ui.div(
+                ui.input_slider("year_range", "Year Range:", min=1950, max=2100, value=(1950, 2006)),
+                ui.input_checkbox_group(
+                    "selected_columns", "Select Data to Display:",
+                    choices=[
+                        "Observed", "Modeled RCP 8.5 Range Min", "Modeled RCP 8.5 Range Max",
+                        "CanESM2 (Average)", "CNRM-CM5 (Cool/Wet)",
+                        "HadGEM2-ES (Warm/Dry)", "MIROC5 (Complement)"
+                    ],
+                    selected=["Observed"]
+                )
+            )
+        return None
+
+    @output
+    @render_widget
+    def climate_plot():
+        df = csv_data.get()
+        if df is None:
+            fig = go.Figure()
+            fig.add_annotation(text="Loading CSV...", x=0.5, y=0.5, showarrow=False)
+            return fig
+
+        if input.data_type() != "Minimum/Maximum Temperature Projections":
+            fig = go.Figure()
+            fig.add_annotation(text="Select Temperature Projections to view graph", x=0.5, y=0.5, showarrow=False)
+            return fig
+
+        if input.temp_subcategory() != "Annual Averages":
+            fig = go.Figure()
+            fig.add_annotation(text="Select Annual Averages to view graph", x=0.5, y=0.5, showarrow=False)
+            return fig
+
+        year_range = input.year_range()
+        selected_cols = input.selected_columns()
+        fig = go.Figure()
+
+        for col in selected_cols:
+            if col in df.columns:
+                mask = (df["year"] >= year_range[0]) & (df["year"] <= year_range[1])
+                fig.add_trace(go.Scatter(
+                    x=df["year"][mask],
+                    y=df[col][mask],
+                    mode="lines",
+                    name=col
+                ))
+
+        if not selected_cols:
+            fig.add_annotation(text="Please select at least one dataset.", x=0.5, y=0.5, showarrow=False)
+
+        fig.update_layout(
+            title=f"Annual Average Minimum Temperature ({year_range[0]}–{year_range[1]})",
+            xaxis_title="Year",
+            yaxis_title="Temperature (°F)",
+            height=500
+        )
+        fig.update_xaxes(range=[year_range[0], year_range[1]])
+        return fig
+
+
+    # --- New: gridbox map and interaction ---
+    selected_gridbox = reactive.Value(None)
+
+    @output
+    @render_widget
+    def gridbox_map():
+        ds = netcdf_ds.get()
+        if ds is None:
+            fig = go.Figure()
+            fig.add_annotation(text="Upload a NetCDF file to see gridboxes.", x=0.5, y=0.5, showarrow=False)
+            return fig
+
+        lats = ds['lat'].values
+        lons = ds['lon'].values
+        lon_grid, lat_grid = np.meshgrid(lons, lats)
+
+        df_grid = pd.DataFrame({
+            "lat": lat_grid.flatten(),
+            "lon": lon_grid.flatten(),
+            "grid_id": range(lat_grid.size)
+        })
+
+        # Approximate Santa Barbara County bounding box — adjust as needed
+        sb_lat_min, sb_lat_max = 34.3, 34.6
+        sb_lon_min, sb_lon_max = -120.0, -119.4
+        df_grid = df_grid[
+            (df_grid["lat"] >= sb_lat_min) & (df_grid["lat"] <= sb_lat_max) &
+            (df_grid["lon"] >= sb_lon_min) & (df_grid["lon"] <= sb_lon_max)
+        ].reset_index(drop=True)
+
+        fig = px.scatter_mapbox(
+            df_grid,
+            lat="lat",
+            lon="lon",
+            hover_name="grid_id",
+            zoom=9,
+            height=600,
+            center={"lat": 34.45, "lon": -119.7},
+        )
+        fig.update_layout(
+            mapbox_style="open-street-map",
+            margin={"r":0,"t":0,"l":0,"b":0}
+        )
+        return fig
+
+    @reactive.Effect
+    def on_gridbox_map_click():
+        click_data = input.gridbox_map_click()
+        if not click_data:
+            return
+        points = click_data.get("points", [])
+        if not points:
+            return
+        point = points[0]
+        grid_id_str = point.get("hovertext") or point.get("text") or None
+        if grid_id_str is None:
+            return
+        try:
+            grid_id = int(grid_id_str)
+            selected_gridbox.set(grid_id)
+        except Exception as e:
+            print(f"Error parsing grid_id from click: {e}")
+
+    @output
+    @render.text
+    def selected_gridbox_info():
+        grid_id = selected_gridbox.get()
+        ds = netcdf_ds.get()
+        if grid_id is None or ds is None:
+            return "Click a gridbox on the map to see details here."
+
+        lats = ds['lat'].values
+        lons = ds['lon'].values
+        nlon = len(lons)
+
+        row = grid_id // nlon
+        col = grid_id % nlon
+
+        lat_val = lats[row]
+        lon_val = lons[col]
+
+        return f"Selected Gridbox ID: {grid_id} at Latitude: {lat_val:.4f}, Longitude: {lon_val:.4f}"
+
+    @output
+    @render_widget
+    def gridbox_climate_plot():
+        grid_id = selected_gridbox.get()
+        ds = netcdf_ds.get()
+        if grid_id is None or ds is None:
+            fig = go.Figure()
+            fig.add_annotation(text="Select a gridbox on the map to see climate data.", x=0.5, y=0.5, showarrow=False)
+            return fig
+
+        lats = ds['lat'].values
+        lons = ds['lon'].values
+        nlon = len(lons)
+        row = grid_id // nlon
+        col = grid_id % nlon
+
+        if "time" not in ds.dims or "tasmin" not in ds.data_vars:
+            fig = go.Figure()
+            fig.add_annotation(text="Dataset missing 'time' dimension or 'tasmin' variable.", x=0.5, y=0.5, showarrow=False)
+            return fig
+
+        tasmin_var = ds['tasmin']  # dims: time x lat x lon
+        times = tasmin_var['time'].values
+        ts = tasmin_var[:, row, col].values
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=times, y=ts, mode="lines", name="tasmin"))
+        fig.update_layout(
+            title=f"Minimum Temperature Timeseries at Gridbox {grid_id}",
+            xaxis_title="Time",
+            yaxis_title="Temperature (K)",
+            height=400,
+        )
+        return fig
+
+
+app = App(app_ui, server)
